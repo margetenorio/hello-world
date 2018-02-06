@@ -1,0 +1,193 @@
+################################################################################
+#
+#  Create reports in Kibana to identify potential exception conditions in the key metrics we are tracking:
+#
+#  Summary reports on Totals:  
+#    Total Costs $ month vs month, Total Accounts month vs month, Total Invoice counts month vs month
+#
+#  Detailed reports by SenderID, this month vs last month: 
+#    Dollar amounts, Invoice counts, Account counts
+#
+#  The detailed reports are to compute the variance from last month to this month and color code 
+#  the variance according to the following formula (subject to change later):
+#  Change < 10%  Green
+#  Change > 10% < 15%  Yellow
+#  Change >= 15% Red
+#
+#  The audience for this report is the LCM team.  Their job is to identify and report significant variances 
+#  in the volumes of data that SPRINT has received in a given month relative to last month.
+#  
+#  Story#  : 1384904
+#  RTC Link: https://igartc03.swg.usma.ibm.com/jazz/web/projects/Cloud%20Web%20Enablement#action=com.ibm.team.workitem.viewWorkItem&id=1384904
+#
+#	Revision History
+#	===========================================================================
+#	Date			Author				Description 
+#	===========================================================================
+#	12/21/16		JJD/Melvin			Made watcher for Billing Control
+#	12/24/16		JJD/Melvin			Edited index payload to create different fields with a timestamp
+#
+#
+################################################################################
+# Extenal Dependencies:
+# -----------------------
+# 1) Watcher plugin must be installed on the target instance of ES
+# 2) The configuration.yml in ES must contain the SLACK integration information
+# 3) 
+#
+#
+################################################################################
+
+curl -XPUT <hostname>:<port#>/_watcher/watch/Billing_Control_Watch -d
+'{
+	"trigger" : { "schedule" : { "interval" : "7300d" } },
+ 
+    "input": {
+        "search": {
+            "request": {
+                "indices": ["billing_requests"],
+                "body": {                    
+					"size": 0,
+					"aggs": {
+						"senderID": {
+							"terms": {
+								"field": "senderID",
+								"size": 50,
+								"order": {
+									"_count": "desc"
+								}
+							},
+							"aggs": {
+								"lastMonth": {
+									"filter": {
+										"query": {
+											"range": {
+												"@timestamp": {
+													"gte": "now-1M/M",
+													"lte": "now-1M",
+													"time_zone": "-04:00"
+												}
+											}
+										}
+									},
+									"aggs": {
+										"invoice$Amounts": {
+											"sum": {
+												"field": "invoiceAmount"
+											}
+										},
+										"nbrOfAccounts": {
+											"cardinality": {
+												"field": "accountId"
+											}
+										},
+										"nbrOfInvoices": {
+											"cardinality": {
+												"field": "invoiceNumber"
+											}
+										}
+									}
+								},
+								"thisMonth": {
+									"filter": {
+										"query": {
+											"range": {
+												"@timestamp": {
+													"gte": "now/M",
+													"lte": "now",
+													"time_zone": "-04:00"
+												}
+											}
+										}
+									},
+									"aggs": {
+										"invoice$Amounts": {
+											"sum": {
+												"field": "invoiceAmount"
+											}
+										},
+										"nbrOfAccounts": {
+											"cardinality": {
+												"field": "accountId"
+											}
+										},
+										"nbrOfInvoices": {
+											"cardinality": {
+												"field": "invoiceNumber"
+											}
+										}
+									}
+								},
+								"salesDelta": {
+									"bucket_script": {
+										"buckets_path": {
+											"thisMonthSales": "thisMonth.invoice$Amounts",
+											"lastMonthSales": "lastMonth.invoice$Amounts"
+										},
+										"script": "(((thisMonthSales - lastMonthSales) / lastMonthSales) * 100).round(2)"
+									}
+								},
+								"accountDelta": {
+									"bucket_script": {
+										"buckets_path": {
+											"thisMonthAccounts": "thisMonth.nbrOfAccounts",
+											"lastMonthAccounts": "lastMonth.nbrOfAccounts"
+										},
+										"script": "(((thisMonthAccounts - lastMonthAccounts) / lastMonthAccounts) * 100).round(2)"
+									}
+								},
+								"invoicesDelta": {
+									"bucket_script": {
+										"buckets_path": {
+											"thisMonthInvoices": "thisMonth.nbrOfInvoices",
+											"lastMonthInvoices": "lastMonth.nbrOfInvoices"
+										},
+										"script": "(((thisMonthInvoices - lastMonthInvoices) / lastMonthInvoices) * 100).round(2)"
+									}
+								}
+							}
+						}
+					}
+                }
+            }
+        }
+    },
+      
+	"condition" : { "compare" : { "ctx.payload.hits.total" : { "gt" : 0 }} },
+ 
+	"actions" : {
+		"log_error" : {
+			"logging" : {
+				"text" : "Billing_Control_Watch finished computing Metrics for Billing data."
+			}
+		},
+            
+		"index_payload" : {
+			"transform": {
+				"script": "buckets = ctx.payload.aggregations.senderID.buckets; Date now = new Date();  buckets.each{ it.timestamp=now;}; return [ _doc : buckets ]"
+			},         
+			"index" : {
+				"index" : "billing_reqs_control",
+				"doc_type" : "deltas"
+			}
+		},
+    
+		"notify-slack" : {
+			"throttle_period" : "7300d",
+			"slack" : {
+				"account" : "monitoring",
+				"message" : {
+					"from" : "Billing_Control_Watch",
+					"to" :  "#general",
+					"text" : "Info:  SPRINT_Billing_Control_Watch finished computing Metrics for Billing data",
+					"icon" : ":watcher:",
+					"attachments" : [{
+						"title" : "Billing_Control_Watch",
+						"text" : "Found {{ctx.payload.hits.total}} .  Finished ",
+						"color" : "good"
+					}]
+				}
+			}
+		}	  
+	}
+}'
